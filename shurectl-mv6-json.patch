@@ -1,0 +1,174 @@
+diff --git a/src/device.rs b/src/device.rs
+index 008ec6a..0d622cd 100644
+--- a/src/device.rs
++++ b/src/device.rs
+@@ -664,8 +664,13 @@ impl ShureDevice {
+             | DeviceModel::Mv7Plus => self.query(&playback_mix, readback)?,
+         }
+ 
++        self.query_as(
++            &cmd_get_mv6_mute_btn_disable(self.next_seq()),
++            Need::Optional,
++            readback,
++        )?;
++
+         let getters: &[fn(u8) -> Vec<u8>] = &[
+-            cmd_get_mv6_mute_btn_disable,
+             cmd_get_device_name,
+             cmd_get_firmware_version,
+             cmd_get_serial,
+diff --git a/src/main.rs b/src/main.rs
+index 03dbb6a..044ecd3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -127,6 +127,14 @@ struct Cli {
+           value_parser = clap::value_parser!(u8).range(1..=presets::PRESET_COUNT as i64))]
+     preset: Option<u8>,
+ 
++    /// Print the current device state as JSON and exit.
++    #[arg(long)]
++    json: bool,
++
++    /// Set a device setting directly (e.g. gain=240, mode=auto, tone=0, denoiser=true, popper_stopper=true, hpf=75hz, gain_lock=false, monitor_mix=50).
++    #[arg(long, value_name = "KEY=VALUE")]
++    set: Vec<String>,
++
+     /// Maintainers only: drive the app headlessly with JSON lines on stdin and
+     /// stdout, for tests/e2e.rs and agent QA. Needs --demo MODEL or
+     /// --fake-device MODEL; never opens real hardware.
+@@ -154,6 +162,14 @@ fn main() -> Result<()> {
+         return harness::run_qa(parse_demo_model(model)?, fake);
+     }
+ 
++    if !cli.set.is_empty() {
++        return cmd_set(&cli.set, cli.device.as_deref());
++    }
++
++    if cli.json {
++        return cmd_json(cli.device.as_deref());
++    }
++
+     if let Some(action) = cli.mute {
+         let path = cli.device.as_deref();
+         return cmd_mute(action, path);
+@@ -304,6 +320,120 @@ fn install_terminal_restore_hook() {
+     }));
+ }
+ 
++fn cmd_json(device_path: Option<&str>) -> Result<()> {
++    let dev = open_cli_device(device_path)?;
++    let model = dev.model;
++    let st = dev.get_state().context("Could not read device state")?.state;
++    let hpf_str = match st.hpf {
++        protocol::HpfFrequency::Off => "off",
++        protocol::HpfFrequency::Hz75 => "75hz",
++        protocol::HpfFrequency::Hz150 => "150hz",
++    };
++    let mode_str = match st.mode {
++        InputMode::Auto => "auto",
++        InputMode::Manual => "manual",
++    };
++    let obj = serde_json::json!({
++        "model": model.display_name(),
++        "device_name": st.device_name,
++        "firmware_version": st.firmware_version,
++        "factory_serial": st.factory_serial,
++        "serial_number": st.serial_number,
++        "muted": st.muted,
++        "mode": mode_str,
++        "gain_tenths": st.gain_tenths,
++        "gain_db": (st.gain_tenths as f32) / 10.0,
++        "tone": st.tone,
++        "denoiser": st.denoiser_enabled,
++        "popper_stopper": st.popper_stopper_enabled,
++        "hpf": hpf_str,
++        "gain_locked": st.mv6_gain_locked,
++        "mute_btn_disabled": st.mute_btn_disabled,
++        "monitor_mix": st.monitor_mix,
++        "playback_mix": st.playback_mix,
++    });
++    println!("{}", serde_json::to_string_pretty(&obj)?);
++    Ok(())
++}
++
++fn cmd_set(pairs: &[String], device_path: Option<&str>) -> Result<()> {
++    let dev = open_cli_device(device_path)?;
++    for pair in pairs {
++        let Some((k, v)) = pair.split_once('=') else {
++            anyhow::bail!("Invalid --set argument \"{pair}\"; expected KEY=VALUE");
++        };
++        let key = k.trim().to_ascii_lowercase();
++        let val = v.trim();
++        match key.as_str() {
++            "gain" | "gain_tenths" => {
++                let tenths: u16 = if key == "gain" && val.contains('.') {
++                    let db: f32 = val.parse().context("Invalid gain_db")?;
++                    (db * 10.0).round() as u16
++                } else if key == "gain" {
++                    let db: f32 = val.parse().context("Invalid gain")?;
++                    if db <= 60.0 {
++                        (db * 10.0).round() as u16
++                    } else {
++                        db as u16
++                    }
++                } else {
++                    val.parse().context("Invalid gain_tenths")?
++                };
++                dev.set_gain(tenths).context("Could not set gain")?;
++            }
++            "mode" => {
++                let st = dev.get_state().context("Could not read state")?.state;
++                let auto = matches!(val.to_ascii_lowercase().as_str(), "auto" | "true" | "1");
++                dev.set_mode(auto, st.auto_position, st.auto_tone)
++                    .context("Could not set mode")?;
++            }
++            "mute" => {
++                let muted = matches!(val.to_ascii_lowercase().as_str(), "on" | "true" | "1");
++                dev.set_mute(muted).context("Could not set mute")?;
++            }
++            "tone" => {
++                let tone: i8 = val.parse().context("Invalid tone (-10..10)")?;
++                dev.set_mv6_tone(tone).context("Could not set tone")?;
++            }
++            "denoiser" => {
++                let en = matches!(val.to_ascii_lowercase().as_str(), "on" | "true" | "1");
++                dev.set_mv6_denoiser(en).context("Could not set denoiser")?;
++            }
++            "popper_stopper" => {
++                let en = matches!(val.to_ascii_lowercase().as_str(), "on" | "true" | "1");
++                dev.set_mv6_popper_stopper(en)
++                    .context("Could not set popper_stopper")?;
++            }
++            "hpf" => {
++                let freq = match val.to_ascii_lowercase().as_str() {
++                    "off" | "0" => protocol::HpfFrequency::Off,
++                    "75" | "75hz" => protocol::HpfFrequency::Hz75,
++                    "150" | "150hz" => protocol::HpfFrequency::Hz150,
++                    other => anyhow::bail!("Unknown hpf value: {other}"),
++                };
++                dev.set_hpf(&freq).context("Could not set hpf")?;
++            }
++            "gain_lock" => {
++                let locked = matches!(val.to_ascii_lowercase().as_str(), "on" | "true" | "1");
++                dev.set_mv6_gain_lock(locked)
++                    .context("Could not set gain_lock")?;
++            }
++            "mute_btn_disable" => {
++                let dis = matches!(val.to_ascii_lowercase().as_str(), "on" | "true" | "1");
++                dev.set_mv6_mute_btn_disable(dis)
++                    .context("Could not set mute_btn_disable")?;
++            }
++            "monitor_mix" => {
++                let mix: u8 = val.parse().context("Invalid monitor_mix (0..100)")?;
++                dev.set_monitor_mix(mix)
++                    .context("Could not set monitor_mix")?;
++            }
++            other => anyhow::bail!("Unknown setting key: {other}"),
++        }
++    }
++    Ok(())
++}
++
+ /// Apply a mute action to the connected device without launching the TUI.
+ ///
+ /// Opens the device (or the specific path if `--device` was given), reads
