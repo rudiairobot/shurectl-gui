@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Shure Audio Control
+Comment=Configurator and Level Monitor for Shure USB Microphones
+Exec=/home/paparoot/.local/bin/shurectl-gui
+Icon=audio-input-microphone
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Recorder;Settings;
+Keywords=shure;mv6;mv7;microphone;audio;gain;mute;
+StartupNotify=true
+StartupWMClass=com.shure.shurectl.gui
