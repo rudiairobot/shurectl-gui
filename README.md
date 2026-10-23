@@ -4,6 +4,8 @@ A native Linux desktop GUI application (built with **GTK 4** & **Libadwaita**) f
 
 Powered by [`shurectl`](https://github.com/Humblemonk/shurectl) and **PipeWire / WirePlumber**.
 
+![Shure Audio Control Screenshot](images/screenshot.png)
+
 ---
 
 ## ✨ Features
